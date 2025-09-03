@@ -3,7 +3,7 @@
 Daily RSI(14) + Trend scan (Alpaca) — logs symbols that match:
     RSI14(15m) < 30  AND  SMA60(15m) < SMA240(15m)
 
-- Runs once per day (UTC) at RUN_AT_UTC (default 09:00).
+- Runs once per day (self-scheduled inside the container).
 - Scans a configurable asset universe from Alpaca.
 - No trading, just logs results for Railway stdout.
 
@@ -17,9 +17,9 @@ Env vars:
   INCLUDE_FRACTIONAL=true|false (default true)  [us_equity only]
   EXCH_LIST=comma,separated,exchanges  (optional; e.g. NYSE,NASDAQ,ARCA)
   BATCH_SIZE=int (default 50)
-  HISTORY_DAYS_15M=int (default 14)
-  RUN_AT_UTC=HH:MM (default 09:00)
-  DRY_RUN=true|false (default true)  # no effect here (read-only), kept for symmetry
+  HISTORY_DAYS_15M=int (default 14)  # enough for RSI14 + SMA240 warmup
+  RUN_AT_UTC=HH:MM (default 09:00)   # when the next daily scan should run (UTC)
+  DRY_RUN=true|false (default true)  # no trading either way; kept for symmetry
 """
 
 import os
@@ -28,7 +28,7 @@ import math
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple, Optional
 
-from alpaca_trade_api.rest import REST, TimeFrame
+from alpaca_trade_api.rest import REST  # classic SDK you’re using
 
 # ========= Config =========
 DATA_FEED = os.getenv("DATA_FEED", "iex").lower()
@@ -38,7 +38,7 @@ INCLUDE_FRACTIONAL = os.getenv("INCLUDE_FRACTIONAL", "true").lower() == "true"
 EXCH_LIST = [e.strip().upper() for e in os.getenv("EXCH_LIST", "").split(",") if e.strip()]
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
-HISTORY_DAYS_15M = int(os.getenv("HISTORY_DAYS_15M", "14"))  # enough for 240+RSI warmup
+HISTORY_DAYS_15M = int(os.getenv("HISTORY_DAYS_15M", "14"))  # ≥240+14 bars ≈ ~255 bars
 RUN_AT_UTC = os.getenv("RUN_AT_UTC", "09:00")  # daily schedule (container stays alive)
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
@@ -82,35 +82,64 @@ def sma(closes: List[float], length: int) -> float:
         return float("nan")
     return sum(closes[-length:]) / float(length)
 
-# ========= Universe =========
-def load_symbols() -> List[str]:
-    status = None if STATUS_FILTER == "all" else STATUS_FILTER
-    symbols: List[str] = []
+# ========= Universe (robust across SDK variations) =========
+def _asset_class(asset) -> str:
+    # Some SDKs expose "class", others "asset_class"—normalize it.
+    return (getattr(asset, "asset_class", None) or getattr(asset, "class", None) or "").lower()
 
-    def want(asset) -> bool:
-        if status and asset.status != status:
-            return False
-        if UNIVERSE in ("us_equity", "both") and asset.asset_class == "us_equity":
-            if not asset.tradable:
-                return False
-            if not INCLUDE_FRACTIONAL and getattr(asset, "fractionable", False):
-                return False
-            if EXCH_LIST and (asset.exchange not in EXCH_LIST):
-                return False
-            return True
-        if UNIVERSE in ("crypto", "both") and asset.asset_class == "crypto":
-            if not asset.tradable:
-                return False
-            return True
+def _asset_exchange(asset) -> str:
+    # Equities have "exchange"; crypto may not.
+    return (getattr(asset, "exchange", "") or "").upper()
+
+def want(asset) -> bool:
+    cls = _asset_class(asset)
+    status = getattr(asset, "status", None)  # e.g., "active"
+    tradable = bool(getattr(asset, "tradable", False))
+    fractionable = bool(getattr(asset, "fractionable", False))
+
+    # Status filter
+    if STATUS_FILTER != "all" and status != STATUS_FILTER:
         return False
 
-    # get_assets returns all types; filter per settings
-    assets = api.list_assets()
-    for a in assets:
-        if want(a):
-            symbols.append(a.symbol)
+    # Universe filter
+    if UNIVERSE in ("us_equity", "both") and cls == "us_equity":
+        if not tradable:
+            return False
+        if not INCLUDE_FRACTIONAL and fractionable:
+            return False
+        if EXCH_LIST:
+            exch = _asset_exchange(asset)
+            if exch not in EXCH_LIST:
+                return False
+        return True
 
-    symbols = sorted(list(set(symbols)))
+    if UNIVERSE in ("crypto", "both") and cls == "crypto":
+        if not tradable:
+            return False
+        return True
+
+    return False
+
+def load_symbols() -> List[str]:
+    # Ask server for everything; local filters handle differences across SDKs.
+    try:
+        assets = api.list_assets()  # returns a list of Asset entities
+    except Exception as e:
+        log(f"Failed to list assets: {type(e).__name__}: {e}")
+        return []
+
+    symbols: List[str] = []
+    for a in assets:
+        try:
+            if want(a):
+                sym = getattr(a, "symbol", None) or getattr(a, "name", None) or ""
+                if sym:
+                    symbols.append(sym)
+        except Exception as e:
+            log(f"Asset filtering error: {type(e).__name__}: {e}")
+
+    # Clean up
+    symbols = sorted(set(symbols))
     log(f"Universe loaded: {len(symbols)} symbols (UNIVERSE={UNIVERSE}, STATUS={STATUS_FILTER}, FEED={DATA_FEED})")
     return symbols
 
@@ -118,16 +147,17 @@ def load_symbols() -> List[str]:
 def fetch_15m_bars(symbols: List[str], start: datetime, end: datetime):
     """
     Fetch 15m bars for a batch of symbols using the multi-symbol endpoint.
-    Returns a pandas MultiIndex DataFrame in .df form (may be empty).
+    Returns a pandas DataFrame in .df form (MultiIndex: [symbol, time]) or None.
+    We keep the call signature compatible with alpaca-trade-api versions.
     """
+    # For classic SDK, passing timeframe as "15Min" works well.
     bars = api.get_bars(
         symbols,
-        TimeFrame.Minute,  # we’ll request 15m via the '15Min' alias below
+        "15Min",  # timeframe
         start=start.isoformat(),
         end=end.isoformat(),
         adjustment="raw",
         feed=DATA_FEED,
-        timeframe="15Min",  # explicit alias; alpaca_trade_api accepts this kw
         limit=None,
     )
     return getattr(bars, "df", None)
@@ -138,8 +168,12 @@ def last_closed_only(sym_df, bar_minutes: int = 15):
     if it is a forming (not fully closed) bar.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=bar_minutes)
-    if not sym_df.empty and sym_df.index[-1].to_pydatetime().replace(tzinfo=timezone.utc) > cutoff:
-        return sym_df.iloc[:-1]
+    try:
+        last_time = sym_df.index[-1].to_pydatetime().replace(tzinfo=timezone.utc)
+        if last_time > cutoff:
+            return sym_df.iloc[:-1]
+    except Exception:
+        pass
     return sym_df
 
 def scan_batch(symbols: List[str], start: datetime, end: datetime) -> List[Tuple[str, float, float, float]]:
@@ -151,36 +185,56 @@ def scan_batch(symbols: List[str], start: datetime, end: datetime) -> List[Tuple
         log(f"Batch fetch: no data for {len(symbols)} symbols (holiday/closed/latency?)")
         return []
 
-    matches = []
-    # If MultiIndex, level 0 is symbol; else single symbol
-    multi = isinstance(df.index, type(df.index)) and getattr(df.index, "nlevels", 1) > 1
-    sym_groups = df.groupby(level=0) if multi else [(symbols[0], df)]
+    matches: List[Tuple[str, float, float, float]] = []
 
-    for sym, sym_df in sym_groups:
+    # Group by symbol whether MultiIndex or not
+    # Try to detect multi-index (symbol,time). If not, treat as single-symbol frame.
+    try:
+        nlevels = getattr(df.index, "nlevels", 1)
+    except Exception:
+        nlevels = 1
+
+    if nlevels > 1:
+        # MultiIndex; level 0 is symbol
+        # Safer to iterate actual symbols present in the frame:
         try:
-            # Normalize to one symbol DataFrame
-            if multi:
-                s_df = sym_df.sort_index()
-            else:
-                s_df = sym_df.sort_index()
-
+            symbols_in_df = list(dict.fromkeys(df.index.get_level_values(0)))
+        except Exception:
+            symbols_in_df = []
+        for sym in symbols_in_df:
+            try:
+                sym_df = df.xs(sym, level=0).sort_index()
+                sym_df = last_closed_only(sym_df, 15)
+                if sym_df.empty:
+                    continue
+                closes = sym_df["close"].astype(float).tolist()
+                if len(closes) < (240 + 14):
+                    continue
+                r = rsi(closes, 14)
+                s60 = sma(closes, 60)
+                s240 = sma(closes, 240)
+                if (not math.isnan(r)) and (not math.isnan(s60)) and (not math.isnan(s240)):
+                    if (r < 30.0) and (s60 < s240):
+                        matches.append((sym, r, s60, s240))
+            except Exception as e:
+                log(f"{sym} | scan error: {type(e).__name__}: {e}")
+    else:
+        # Single symbol DataFrame (happens when batch size is 1 or SDK returns flattened df)
+        sym = symbols[0] if symbols else ""
+        try:
+            s_df = df.sort_index()
             s_df = last_closed_only(s_df, 15)
-            if s_df.empty:
-                continue
-
-            closes = s_df["close"].astype(float).tolist()
-            if len(closes) < (240 + 14):  # warmup: need ≥ 254 closes
-                continue
-
-            r = rsi(closes, 14)
-            s60 = sma(closes, 60)
-            s240 = sma(closes, 240)
-
-            if (not math.isnan(r)) and (not math.isnan(s60)) and (not math.isnan(s240)):
-                if (r < 30.0) and (s60 < s240):
-                    matches.append((sym, r, s60, s240))
+            if not s_df.empty:
+                closes = s_df["close"].astype(float).tolist()
+                if len(closes) >= (240 + 14):
+                    r = rsi(closes, 14)
+                    s60 = sma(closes, 60)
+                    s240 = sma(closes, 240)
+                    if (not math.isnan(r)) and (not math.isnan(s60)) and (not math.isnan(s240)):
+                        if (r < 30.0) and (s60 < s240):
+                            matches.append((sym, r, s60, s240))
         except Exception as e:
-            log(f"{sym} | scan error: {type(e).__name__}: {e}")
+            log(f"{sym or 'single'} | scan error: {type(e).__name__}: {e}")
 
     return matches
 
@@ -208,7 +262,6 @@ def run_scan_once():
         processed += len(batch)
         if processed % (BATCH_SIZE*4) == 0 or processed == total:
             log(f"Progress: {processed}/{total} symbols")
-
         # Small pacing delay to be gentle on API
         time.sleep(0.5)
 
