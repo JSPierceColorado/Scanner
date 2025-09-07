@@ -17,7 +17,7 @@ Env vars:
   INCLUDE_FRACTIONAL=true|false (default true)  [us_equity only]
   EXCH_LIST=comma,separated,exchanges  (optional; e.g. NYSE,NASDAQ,ARCA)
   BATCH_SIZE=int (default 50)
-  HISTORY_DAYS_15M=int (default 14)  # enough for RSI14 + SMA240 warmup
+  HISTORY_DAYS_15M=int (default 35)  # enough for RSI14 + SMA240 warmup
   RUN_AT_UTC=HH:MM (default 09:00)   # when the next daily scan should run (UTC)
   DRY_RUN=true|false (default true)  # no trading either way; kept for symmetry
 """
@@ -38,7 +38,7 @@ INCLUDE_FRACTIONAL = os.getenv("INCLUDE_FRACTIONAL", "true").lower() == "true"
 EXCH_LIST = [e.strip().upper() for e in os.getenv("EXCH_LIST", "").split(",") if e.strip()]
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
-HISTORY_DAYS_15M = int(os.getenv("HISTORY_DAYS_15M", "14"))  # ≥240+14 bars ≈ ~255 bars
+HISTORY_DAYS_15M = int(os.getenv("HISTORY_DAYS_15M", "35"))  # ensure ≥254 closed 15m bars
 RUN_AT_UTC = os.getenv("RUN_AT_UTC", "09:00")  # daily schedule (container stays alive)
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
